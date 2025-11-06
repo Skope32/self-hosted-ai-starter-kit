@@ -7,67 +7,156 @@ volumes:
 networks:
   demo:
 
+##############################
+# N8N Template
+##############################
 x-n8n: &service-n8n
   image: n8nio/n8n:latest
-  networks: ['demo']
+  networks: ["demo"]
   environment:
     - DB_TYPE=postgresdb
     - DB_POSTGRESDB_HOST=postgres
     - DB_POSTGRESDB_USER=${POSTGRES_USER}
     - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+    - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+    - N8N_USER_MANAGEMENT_JWT_SECRET=${N8N_USER_MANAGEMENT_JWT_SECRET}
     - N8N_DIAGNOSTICS_ENABLED=false
     - N8N_PERSONALIZATION_ENABLED=false
-    - N8N_ENCRYPTION_KEY
-    - N8N_USER_MANAGEMENT_JWT_SECRET
     - OLLAMA_HOST=${OLLAMA_HOST:-ollama:11434}
   env_file:
-    - path: .env
-      required: true
+    - .env
 
+##############################
+# OLLAMA Template (Optimized)
+##############################
 x-ollama: &service-ollama
   image: ollama/ollama:latest
   container_name: ollama
-  networks: ['demo']
+  networks: ["demo"]
   restart: unless-stopped
   ports:
-    - 11434:11434
+    - "11434:11434"
   volumes:
     - ollama_storage:/root/.ollama
+  environment:
+    # Performance optimizations
+    - OLLAMA_NUM_PARALLEL=2
+    - OLLAMA_MAX_LOADED_MODELS=1
+    - OLLAMA_KEEP_ALIVE=5m
+  shm_size: '2gb'
 
+##############################
+# Model Pull Template (Smaller Models)
+##############################
 x-init-ollama: &init-ollama
   image: ollama/ollama:latest
-  networks: ['demo']
-  container_name: ollama-pull-llama
+  networks: ["demo"]
+  entrypoint: /bin/sh
   volumes:
     - ollama_storage:/root/.ollama
-  entrypoint: /bin/sh
-  environment:
-    - OLLAMA_HOST=ollama:11434
   command:
     - "-c"
-    - "sleep 3; ollama pull llama3.2"
+    - "sleep 5; OLLAMA_HOST=ollama:11434 ollama pull llama3.2:3b; ollama pull nomic-embed-text:latest"
 
+##############################
+# SERVICES
+##############################
 services:
+
   postgres:
     image: postgres:16-alpine
-    hostname: postgres
-    networks: ['demo']
+    networks: ["demo"]
     restart: unless-stopped
+    ports:
+      - "5432:5432"
     environment:
       - POSTGRES_USER
       - POSTGRES_PASSWORD
       - POSTGRES_DB
     volumes:
       - postgres_storage:/var/lib/postgresql/data
-    healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
-      interval: 5s
-      timeout: 5s
-      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 
+  #####################################
+  # CPU-Only Ollama (Default)
+  #####################################
+  ollama:
+    <<: *service-ollama
+    profiles: ["cpu"]
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+
+  #####################################
+  # NVIDIA CUDA GPU
+  #####################################
+  ollama-cuda:
+    <<: *service-ollama
+    profiles: ["cuda"]
+    image: ollama/ollama:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  #####################################
+  # AMD ROCm GPU
+  #####################################
+  ollama-rocm:
+    <<: *service-ollama
+    profiles: ["rocm"]
+    image: ollama/ollama:rocm
+    devices:
+      - "/dev/kfd"
+      - "/dev/dri"
+
+  #####################################
+  # Pull Lightweight Models
+  #####################################
+  ollama-pull-models:
+    <<: *init-ollama
+    profiles: ["cpu", "cuda", "rocm"]
+    depends_on:
+      ollama:
+        condition: service_started
+        required: false
+      ollama-cuda:
+        condition: service_started
+        required: false
+      ollama-rocm:
+        condition: service_started
+        required: false
+
+  #####################################
+  # Qdrant Vector DB (Optimized)
+  #####################################
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    networks: ["demo"]
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  #####################################
+  # n8n Import
+  #####################################
   n8n-import:
     <<: *service-n8n
-    hostname: n8n-import
     container_name: n8n-import
     entrypoint: /bin/sh
     command:
@@ -76,75 +165,47 @@ services:
     volumes:
       - ./n8n/demo-data:/demo-data
     depends_on:
-      postgres:
-        condition: service_healthy
+      - postgres
 
+  #####################################
+  # n8n Main App
+  #####################################
   n8n:
     <<: *service-n8n
-    hostname: n8n
     container_name: n8n
     restart: unless-stopped
     ports:
-      - 5678:5678
+      - "5678:5678"
     volumes:
       - n8n_storage:/home/node/.n8n
       - ./n8n/demo-data:/demo-data
       - ./shared:/data/shared
     depends_on:
-      postgres:
-        condition: service_healthy
-      n8n-import:
-        condition: service_completed_successfully
-
-  qdrant:
-    image: qdrant/qdrant
-    hostname: qdrant
-    container_name: qdrant
-    networks: ['demo']
-    restart: unless-stopped
-    ports:
-      - 6333:6333
-    volumes:
-      - qdrant_storage:/qdrant/storage
-
-  ollama-cpu:
-    profiles: ["cpu"]
-    <<: *service-ollama
-
-  ollama-gpu:
-    profiles: ["gpu-nvidia"]
-    <<: *service-ollama
+      - postgres
+      - n8n-import
     deploy:
       resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+        limits:
+          memory: 2G
 
-  ollama-gpu-amd:
-    profiles: ["gpu-amd"]
-    <<: *service-ollama
-    image: ollama/ollama:rocm
-    devices:
-      - "/dev/kfd"
-      - "/dev/dri"
-
-  ollama-pull-llama-cpu:
-    profiles: ["cpu"]
-    <<: *init-ollama
-    depends_on:
-      - ollama-cpu
-
-  ollama-pull-llama-gpu:
-    profiles: ["gpu-nvidia"]
-    <<: *init-ollama
-    depends_on:
-      - ollama-gpu
-
-  ollama-pull-llama-gpu-amd:
-    profiles: [gpu-amd]
-    <<: *init-ollama
-    image: ollama/ollama:rocm
-    depends_on:
-     - ollama-gpu-amd
+  #####################################
+  # OPEN WEBUI (Optimized)
+  #####################################
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:latest
+    container_name: open-webui
+    restart: unless-stopped
+    networks: ["demo"]
+    ports:
+      - "3000:8080"
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - WEBUI_AUTH=true
+      - DEFAULT_USER_EMAIL=${DEFAULT_USER_EMAIL}
+      - DEFAULT_USER_PASSWORD=${DEFAULT_USER_PASSWORD}
+    volumes:
+      - ./open-webui:/app/backend/data
+    deploy:
+      resources:
+        limits:
+          memory: 1G
